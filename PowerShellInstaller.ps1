@@ -99,18 +99,38 @@ function Test-ModuleInstalled {
         [string]$MinVersion
     )
     try {
-        $installed = Get-InstalledModule -Name $ModuleName -ErrorAction SilentlyContinue
-        if ($null -eq $installed) {
-            return @{ Status = "NotInstalled"; Version = $null }
+        # First, try using Get-Module -ListAvailable (doesn't require PowerShellGet to work)
+        $installedModules = Get-Module -ListAvailable -Name $ModuleName -ErrorAction SilentlyContinue
+        
+        if ($null -eq $installedModules -or $installedModules.Count -eq 0) {
+            # Try Get-InstalledModule as fallback (requires PowerShellGet)
+            try {
+                $installed = Get-InstalledModule -Name $ModuleName -ErrorAction SilentlyContinue
+                if ($null -eq $installed) {
+                    return @{ Status = "NotInstalled"; Version = $null }
+                }
+                $installedVersion = [version]$installed.Version
+                $requiredVersion = [version]$MinVersion
+                
+                if ($installedVersion -ge $requiredVersion) {
+                    return @{ Status = "UpToDate"; Version = $installed.Version }
+                } else {
+                    return @{ Status = "OutOfDate"; Version = $installed.Version }
+                }
+            } catch {
+                return @{ Status = "NotInstalled"; Version = $null }
+            }
         }
         
-        $installedVersion = [version]$installed.Version
+        # Get the latest version from the installed modules
+        $latestModule = $installedModules | Sort-Object -Property Version -Descending | Select-Object -First 1
+        $installedVersion = [version]$latestModule.Version
         $requiredVersion = [version]$MinVersion
         
         if ($installedVersion -ge $requiredVersion) {
-            return @{ Status = "UpToDate"; Version = $installed.Version }
+            return @{ Status = "UpToDate"; Version = $latestModule.Version.ToString() }
         } else {
-            return @{ Status = "OutOfDate"; Version = $installed.Version }
+            return @{ Status = "OutOfDate"; Version = $latestModule.Version.ToString() }
         }
     } catch {
         return @{ Status = "Error"; Version = $null; Error = $_ }
@@ -129,6 +149,11 @@ function Install-Or-UpdateModule {
     try {
         # Check current installation status
         $status = Test-ModuleInstalled -ModuleName $ModuleName -MinVersion $MinVersion
+        
+        # Show current status
+        if ($status.Status -eq "UpToDate" -or $status.Status -eq "OutOfDate") {
+            Write-Host "  Currently installed: Version $($status.Version)" -ForegroundColor Gray
+        }
 
         # Handle uninstall if requested
         if ($UninstallExisting) {
@@ -142,28 +167,67 @@ function Install-Or-UpdateModule {
         switch ($status.Status) {
             "NotInstalled" {
                 Write-Host "  Installing $ModuleName..." -ForegroundColor Yellow
-                try {
-                    Install-Module -Name $ModuleName -MinimumVersion $MinVersion -Force -AllowClobber -Scope CurrentUser -ErrorAction Stop
-                    $installed = Get-InstalledModule -Name $ModuleName -ErrorAction Stop
-                    Write-Host "  [OK] $ModuleName installed successfully (Version: $($installed.Version))" -ForegroundColor Green
-                    $script:InstallResults.Success += "$ModuleName ($($installed.Version))"
-                } catch {
-                    Write-Host "  [FAILED] Failed to install $ModuleName`: $_" -ForegroundColor Red
-                    $script:InstallResults.Failed += "$ModuleName - $_"
+                $installSuccess = $false
+                
+                # Try Install-Module first (PowerShellGet)
+                if (Get-Command Install-Module -ErrorAction SilentlyContinue) {
+                    try {
+                        Install-Module -Name $ModuleName -MinimumVersion $MinVersion -Force -AllowClobber -Scope CurrentUser -ErrorAction Stop
+                        # Verify installation
+                        $installed = Get-Module -ListAvailable -Name $ModuleName -ErrorAction SilentlyContinue | Sort-Object -Property Version -Descending | Select-Object -First 1
+                        if ($installed) {
+                            Write-Host "  [OK] $ModuleName installed successfully (Version: $($installed.Version))" -ForegroundColor Green
+                            $script:InstallResults.Success += "$ModuleName ($($installed.Version))"
+                            $installSuccess = $true
+                        }
+                    } catch {
+                        Write-Host "  [WARNING] Install-Module failed: $_" -ForegroundColor Yellow
+                        Write-Host "  Trying alternative method..." -ForegroundColor Gray
+                    }
+                }
+                
+                # Fallback: Try PackageManagement (if Install-Module failed)
+                if (-not $installSuccess -and (Get-Command Install-Package -ErrorAction SilentlyContinue)) {
+                    try {
+                        Write-Host "  Attempting via PackageManagement..." -ForegroundColor Yellow
+                        Install-Package -Name $ModuleName -ProviderName NuGet -Force -Scope CurrentUser -ErrorAction Stop
+                        $installed = Get-Module -ListAvailable -Name $ModuleName -ErrorAction SilentlyContinue | Sort-Object -Property Version -Descending | Select-Object -First 1
+                        if ($installed) {
+                            Write-Host "  [OK] $ModuleName installed successfully (Version: $($installed.Version))" -ForegroundColor Green
+                            $script:InstallResults.Success += "$ModuleName ($($installed.Version))"
+                            $installSuccess = $true
+                        }
+                    } catch {
+                        Write-Host "  [WARNING] PackageManagement install failed: $_" -ForegroundColor Yellow
+                    }
+                }
+                
+                if (-not $installSuccess) {
+                    Write-Host "  [FAILED] Failed to install $ModuleName. PowerShellGet may not be working properly." -ForegroundColor Red
+                    Write-Host "  [INFO] You may need to install PowerShellGet manually or check your internet connection." -ForegroundColor Yellow
+                    $script:InstallResults.Failed += "$ModuleName - Installation failed (PowerShellGet issue)"
                 }
             }
             "OutOfDate" {
                 Write-Host "  Installed version ($($status.Version)) is older than required. Updating..." -ForegroundColor Yellow
                 try {
-                    Update-Module -Name $ModuleName -Force -ErrorAction Stop
-                    $updated = Get-InstalledModule -Name $ModuleName -ErrorAction Stop
-                    Write-Host "  [OK] $ModuleName updated successfully (Version: $($updated.Version))" -ForegroundColor Green
-                    $oldVersion = $status.Version
-                    $newVersion = $updated.Version
-                    $script:InstallResults.Updated += "$ModuleName ($oldVersion to $newVersion)"
+                    if (Get-Command Update-Module -ErrorAction SilentlyContinue) {
+                        Update-Module -Name $ModuleName -Force -ErrorAction Stop
+                        $updated = Get-Module -ListAvailable -Name $ModuleName -ErrorAction SilentlyContinue | Sort-Object -Property Version -Descending | Select-Object -First 1
+                        if ($updated) {
+                            Write-Host "  [OK] $ModuleName updated successfully (Version: $($updated.Version))" -ForegroundColor Green
+                            $oldVersion = $status.Version
+                            $newVersion = $updated.Version
+                            $script:InstallResults.Updated += "$ModuleName ($oldVersion to $newVersion)"
+                        } else {
+                            throw "Update completed but module not found"
+                        }
+                    } else {
+                        throw "Update-Module command not available"
+                    }
                 } catch {
                     Write-Host "  [FAILED] Failed to update $ModuleName`: $_" -ForegroundColor Red
-                    $script:InstallResults.Failed += "$ModuleName - $_"
+                    $script:InstallResults.Failed += "$ModuleName - Update failed: $_"
                 }
             }
             "UpToDate" {
@@ -175,10 +239,18 @@ function Install-Or-UpdateModule {
                 # Try to install anyway
                 try {
                     Write-Host "  Attempting to install $ModuleName..." -ForegroundColor Yellow
-                    Install-Module -Name $ModuleName -MinimumVersion $MinVersion -Force -AllowClobber -Scope CurrentUser -ErrorAction Stop
-                    $installed = Get-InstalledModule -Name $ModuleName -ErrorAction Stop
-                    Write-Host "  [OK] $ModuleName installed successfully (Version: $($installed.Version))" -ForegroundColor Green
-                    $script:InstallResults.Success += "$ModuleName ($($installed.Version))"
+                    if (Get-Command Install-Module -ErrorAction SilentlyContinue) {
+                        Install-Module -Name $ModuleName -MinimumVersion $MinVersion -Force -AllowClobber -Scope CurrentUser -ErrorAction Stop
+                        $installed = Get-Module -ListAvailable -Name $ModuleName -ErrorAction SilentlyContinue | Sort-Object -Property Version -Descending | Select-Object -First 1
+                        if ($installed) {
+                            Write-Host "  [OK] $ModuleName installed successfully (Version: $($installed.Version))" -ForegroundColor Green
+                            $script:InstallResults.Success += "$ModuleName ($($installed.Version))"
+                        } else {
+                            throw "Installation completed but module not found"
+                        }
+                    } else {
+                        throw "Install-Module command not available"
+                    }
                 } catch {
                     Write-Host "  [FAILED] Failed to install $ModuleName`: $_" -ForegroundColor Red
                     $script:InstallResults.Failed += "$ModuleName - $_"
@@ -219,22 +291,85 @@ try {
     }
 
     # Ensure PowerShellGet is available and updated
-    if (-not (Get-Module -ListAvailable -Name PowerShellGet)) {
-        Write-Host "  Installing PowerShellGet..." -ForegroundColor Yellow
+    Write-Host "  Checking PowerShellGet..." -ForegroundColor Gray
+    $psGetAvailable = Get-Module -ListAvailable -Name PowerShellGet -ErrorAction SilentlyContinue
+    
+    if (-not $psGetAvailable) {
+        Write-Host "  PowerShellGet not found. Attempting installation..." -ForegroundColor Yellow
         try {
-            Install-Module -Name PowerShellGet -Force -Scope CurrentUser -AllowClobber -ErrorAction Stop
-            Write-Host "  [OK] PowerShellGet installed." -ForegroundColor Green
+            # Try installing via PackageManagement first (more reliable)
+            if (Get-Command Install-Package -ErrorAction SilentlyContinue) {
+                Install-Package -Name PowerShellGet -ProviderName NuGet -Force -Scope CurrentUser -ErrorAction SilentlyContinue
+            }
+            # Also try Install-Module if available
+            if (Get-Command Install-Module -ErrorAction SilentlyContinue) {
+                Install-Module -Name PowerShellGet -Force -Scope CurrentUser -AllowClobber -ErrorAction SilentlyContinue
+            }
+            Write-Host "  [OK] PowerShellGet installation attempted." -ForegroundColor Green
         } catch {
             Write-Warning "  Could not install PowerShellGet: $_"
         }
     } else {
-        Write-Host "  [OK] PowerShellGet already available." -ForegroundColor Green
-        # Try to update PowerShellGet to latest version
+        Write-Host "  [OK] PowerShellGet already available (Version: $(($psGetAvailable | Sort-Object -Property Version -Descending | Select-Object -First 1).Version))." -ForegroundColor Green
+    }
+
+    # Import PowerShellGet module explicitly
+    Write-Host "  Importing PowerShellGet module..." -ForegroundColor Gray
+    try {
+        # Remove any existing PowerShellGet module first to avoid conflicts
+        Remove-Module PowerShellGet -Force -ErrorAction SilentlyContinue
+        Import-Module PowerShellGet -Force -MinimumVersion 2.0.0 -ErrorAction Stop
+        Write-Host "  [OK] PowerShellGet module imported." -ForegroundColor Green
+    } catch {
         try {
-            Update-Module -Name PowerShellGet -Force -ErrorAction SilentlyContinue
+            # Try without version requirement
+            Import-Module PowerShellGet -Force -ErrorAction Stop
+            Write-Host "  [OK] PowerShellGet module imported (legacy version)." -ForegroundColor Green
         } catch {
-            # Non-critical, continue
+            Write-Warning "  Could not import PowerShellGet module: $_"
+            Write-Host "  [WARNING] Module installation may fail. Continuing anyway..." -ForegroundColor Yellow
         }
+    }
+
+    # Ensure PSGallery repository is trusted
+    Write-Host "  Configuring PowerShell Gallery repository..." -ForegroundColor Gray
+    try {
+        if (Get-Command Get-PSRepository -ErrorAction SilentlyContinue) {
+            $psGallery = Get-PSRepository -Name PSGallery -ErrorAction SilentlyContinue
+            if ($null -eq $psGallery) {
+                if (Get-Command Register-PSRepository -ErrorAction SilentlyContinue) {
+                    Write-Host "  Registering PSGallery repository..." -ForegroundColor Yellow
+                    Register-PSRepository -Default -ErrorAction Stop
+                    Write-Host "  [OK] PSGallery repository registered." -ForegroundColor Green
+                    # Re-fetch after registration
+                    $psGallery = Get-PSRepository -Name PSGallery -ErrorAction SilentlyContinue
+                }
+            }
+            
+            # Set PSGallery as trusted if not already
+            if ($null -ne $psGallery -and $psGallery.InstallationPolicy -ne 'Trusted') {
+                if (Get-Command Set-PSRepository -ErrorAction SilentlyContinue) {
+                    Write-Host "  Setting PSGallery as trusted..." -ForegroundColor Yellow
+                    Set-PSRepository -Name PSGallery -InstallationPolicy Trusted -ErrorAction Stop
+                    Write-Host "  [OK] PSGallery set as trusted." -ForegroundColor Green
+                }
+            } elseif ($null -ne $psGallery) {
+                Write-Host "  [OK] PSGallery is already trusted." -ForegroundColor Green
+            }
+        } else {
+            Write-Warning "  Get-PSRepository command not available. Repository configuration skipped."
+        }
+    } catch {
+        Write-Warning "  Could not configure PSGallery repository: $_"
+    }
+
+    # Ensure TLS 1.2 is enabled for module downloads
+    Write-Host "  Configuring TLS settings..." -ForegroundColor Gray
+    try {
+        [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+        Write-Host "  [OK] TLS 1.2 enabled." -ForegroundColor Green
+    } catch {
+        Write-Warning "  Could not configure TLS settings: $_"
     }
 
     # Install or update each required module
