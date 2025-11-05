@@ -278,10 +278,15 @@ try {
 
     # Ensure NuGet Provider is available
     Write-Host "`n[Prerequisites]" -ForegroundColor Cyan
+    Write-Host "  Preconfiguring TLS 1.2 for provider downloads..." -ForegroundColor Gray
+    try {
+        [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+    } catch { }
     if (-not (Get-PackageProvider -Name NuGet -ErrorAction SilentlyContinue)) {
         Write-Host "  Installing NuGet provider..." -ForegroundColor Yellow
         try {
-            Install-PackageProvider -Name NuGet -MinimumVersion "2.8.5.201" -Force -Scope CurrentUser -ErrorAction Stop
+            Install-PackageProvider -Name NuGet -MinimumVersion "2.8.5.201" -Force -Confirm:$false -ErrorAction Stop
+            Import-PackageProvider -Name NuGet -MinimumVersion "2.8.5.201" -Force -ErrorAction SilentlyContinue
             Write-Host "  [OK] NuGet provider installed." -ForegroundColor Green
         } catch {
             Write-Warning "  Could not install NuGet provider: $_"
@@ -339,7 +344,7 @@ try {
             if ($null -eq $psGallery) {
                 if (Get-Command Register-PSRepository -ErrorAction SilentlyContinue) {
                     Write-Host "  Registering PSGallery repository..." -ForegroundColor Yellow
-                    Register-PSRepository -Default -ErrorAction Stop
+                    Register-PSRepository -Name PSGallery -SourceLocation "https://www.powershellgallery.com/api/v2" -ScriptSourceLocation "https://www.powershellgallery.com/api/v2/items/psscript" -InstallationPolicy Trusted -PackageManagementProvider NuGet -ErrorAction Stop
                     Write-Host "  [OK] PSGallery repository registered." -ForegroundColor Green
                     # Re-fetch after registration
                     $psGallery = Get-PSRepository -Name PSGallery -ErrorAction SilentlyContinue
@@ -356,20 +361,19 @@ try {
             } elseif ($null -ne $psGallery) {
                 Write-Host "  [OK] PSGallery is already trusted." -ForegroundColor Green
             }
+            if ($null -ne $psGallery -and ([string]::IsNullOrWhiteSpace($psGallery.SourceLocation) -or [string]::IsNullOrWhiteSpace($psGallery.ScriptSourceLocation))) {
+                if (Get-Command Unregister-PSRepository -ErrorAction SilentlyContinue) {
+                    Write-Host "  Repairing PSGallery repository definition..." -ForegroundColor Yellow
+                    Unregister-PSRepository -Name PSGallery -ErrorAction SilentlyContinue
+                    Register-PSRepository -Name PSGallery -SourceLocation "https://www.powershellgallery.com/api/v2" -ScriptSourceLocation "https://www.powershellgallery.com/api/v2/items/psscript" -InstallationPolicy Trusted -PackageManagementProvider NuGet -ErrorAction Stop
+                    $psGallery = Get-PSRepository -Name PSGallery -ErrorAction SilentlyContinue
+                }
+            }
         } else {
             Write-Warning "  Get-PSRepository command not available. Repository configuration skipped."
         }
     } catch {
         Write-Warning "  Could not configure PSGallery repository: $_"
-    }
-
-    # Ensure TLS 1.2 is enabled for module downloads
-    Write-Host "  Configuring TLS settings..." -ForegroundColor Gray
-    try {
-        [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
-        Write-Host "  [OK] TLS 1.2 enabled." -ForegroundColor Green
-    } catch {
-        Write-Warning "  Could not configure TLS settings: $_"
     }
 
     # Install or update each required module
